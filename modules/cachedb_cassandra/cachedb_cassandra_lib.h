@@ -54,7 +54,6 @@ class CassandraConnection {
 private:
 
 string keyspace;
-string column_family;
 string counter_family;
 string host;
 int port;
@@ -82,13 +81,17 @@ long int make_cassandra_timestamp() const
 
 public:
 
+string column_family;
+string column;
+
 CassandraConnection(const string& keyspace, const string& column_family,const string& counter_family) :
 keyspace(keyspace),
-column_family(column_family),
 counter_family(counter_family),
 host(""),
 port(0),
-client(NULL)
+client(NULL),
+column_family(column_family),
+column("opensips") /* backwards compatibility */
 {
 }
 
@@ -179,7 +182,57 @@ int cassandra_reopen()
 	return cassandra_open(host, port,conn_to,snd_to,rcv_to,rd_level,wr_level);
 }
 
-char* cassandra_simple_get(const string& attr)
+/*
+https://wiki.apache.org/cassandra/ThriftExamples#CA-0aa85a4964830937d53c9c7c4c7815c19aecc1fe_1
+
+*/
+string cassandra_simple_get_slice(const string& attr)
+{
+	int retry=2;
+
+	// get the entire row for a key
+        SliceRange sr;
+        sr.start = "";
+        sr.finish = "";
+
+	SlicePredicate sp;
+	sp.slice_range = sr;
+	sp.__isset.slice_range = true;
+
+	if (client == NULL && cassandra_reopen() != 0) {
+		LM_ERR("No cassandra connection\n");
+		return NULL;
+	}
+
+	do {
+		try {
+			ColumnParent cp;
+			cp.column_family = column_family;
+			cp.super_column = "";
+			vector<ColumnOrSuperColumn> sc;
+
+    			client->get_slice(sc, attr, cp, sp, rd_level);
+			return sc[0].column.value;
+		} catch (InvalidRequestException &ire) {
+       			LM_ERR("ERROR1: %s\n", ire.why.c_str());
+      		}
+		catch (NotFoundException &nfx) {
+			/* signal that it was a success, but not found in back-end */
+			return (char*)-1;
+		}
+		catch (TException &tx) {
+			LM_ERR("ERROR2: %s\n", tx.what());
+		}
+		catch (std::exception &e) {
+ 			LM_ERR("ERROR3: %s\n", e.what());
+		}
+	} while (retry-- && cassandra_reopen() == 0);
+
+	LM_ERR("giving up on query\n");
+	return NULL;
+}
+
+string cassandra_simple_get(const string& attr)
 {
 	int retry=2;
 
@@ -191,16 +244,16 @@ char* cassandra_simple_get(const string& attr)
 	do {
 		try {
 			ColumnPath cp;
-			/* TODO - hard code this ? */
-			string key = "opensips";
-    			cp.__isset.column = true;
-			cp.column = key;
-			cp.column_family = column_family.c_str();
+			if (!column.empty()) {
+				cp.__isset.column = true;
+				cp.column = column;
+			}
+			cp.column_family = column_family;
 			cp.super_column = "";
 			ColumnOrSuperColumn sc;
 
     			client->get(sc, attr, cp, rd_level);
-			return (char *)sc.column.value.c_str();
+			return sc.column.value;
 		} catch (InvalidRequestException &ire) {
        			LM_ERR("ERROR1: %s\n", ire.why.c_str());
       		}
@@ -232,10 +285,8 @@ int cassandra_simple_get_counter(const string& attr,int *value)
 	do {
 		try {
 			ColumnPath cp;
-			/* TODO - hard code this ? */
-			string key = "opensips";
     			cp.__isset.column = true;
-			cp.column = key;
+			cp.column = column.c_str();
 			cp.column_family = counter_family.c_str();
 			cp.super_column = "";
 			ColumnOrSuperColumn sc;
@@ -276,12 +327,10 @@ int cassandra_simple_insert(const string& name,const string& val, int expires)
 
 	do {
 		try {
-			/* TODO - hard code this ? */
-			string key = "opensips";
     			ColumnParent cp;
 			cp.column_family = column_family.c_str();
 			Column c;
-			c.name=key;
+			c.name = column;
 			c.value=val.c_str();
 			c.__isset.value = true;
 			c.timestamp=make_cassandra_timestamp();
@@ -320,11 +369,9 @@ int cassandra_simple_remove(const string& name)
 
 	do {
 		try {
-			/* TODO - hard code this ? */
-			string key = "opensips";
     			ColumnPath cp;
 			cp.column_family = column_family.c_str();
-			cp.column=key;
+			cp.column=column.c_str();
 			cp.__isset.column = true;
 
 			LM_DBG("removing [%s]\n",name.c_str());
@@ -361,13 +408,12 @@ int cassandra_simple_add(const string& name,int val)
 	do {
 		try {
 			/* TODO - hard code this ? */
-			string key = "opensips";
     			ColumnParent cp;
 			cp.column_family = counter_family.c_str();
 			//cp.__isset.column = true;
 
 			CounterColumn cc;
-			cc.name = key;
+			cc.name = column.c_str();
 			cc.value = val;
 
     			client->add(name, cp,cc,wr_level);
@@ -399,13 +445,12 @@ int cassandra_simple_sub(const string& name,int val)
 	do {
 		try {
 			/* TODO - hard code this ? */
-			string key = "opensips";
     			ColumnParent cp;
 			cp.column_family = counter_family.c_str();
 			//cp.__isset.column = true;
 
 			CounterColumn cc;
-			cc.name = key;
+			cc.name = column;
 			cc.value = -val;
 
     			client->add(name, cp,cc,wr_level);

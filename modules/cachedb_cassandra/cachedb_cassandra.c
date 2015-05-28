@@ -118,7 +118,15 @@ static int mod_init(void)
 	cde.cdb_func.add = cassandra_add;
 	cde.cdb_func.sub = cassandra_sub;
 
-	cde.cdb_func.capability = CACHEDB_CAP_BINARY_VALUE;
+        cde.cdb_func.db_query_trans = cassandra_query_trans;
+        cde.cdb_func.db_free_trans = cassandra_free_result_trans;
+        cde.cdb_func.db_insert_trans = cassandra_insert_trans;
+        cde.cdb_func.db_delete_trans = cassandra_delete_trans;
+        cde.cdb_func.db_update_trans = cassandra_update_trans;
+        cde.cdb_func.db_update_trans = cassandra_update_trans;
+	cde.cdb_func.db_raw_trans    = cassandra_raw_trans;
+
+	cde.cdb_func.capability = (CACHEDB_CAP_BINARY_VALUE | CACHEDB_CAP_RAW);
 
 	if (register_cachedb(&cde) < 0) {
 		LM_ERR("failed to initialize cachedb_cassandra\n");
