@@ -726,13 +726,13 @@ routing_info:
 			if (str2int( &(get_cseq(rpl)->number), &cseq_no) < 0) {
 				LM_ERR("Failed to convert cseq to integer \n");
 			} else {
-				if (dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq < cseq_no) {
+				if (dlg->legs[leg].last_gen_cseq < cseq_no) {
 					LM_DBG("updating last_gen_cseq to reply cseq [%d] for method id [%d]\n",
 						cseq_no, get_cseq(rpl)->method_id);
-					dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq = cseq_no;
+					dlg->legs[leg].last_gen_cseq = cseq_no;
 				} else {
 					LM_DBG("keeping higher last_gen_cseq [%d] over reply cseq [%d] for method id [%d]\n",
-						dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq,
+						dlg->legs[leg].last_gen_cseq,
 						cseq_no, get_cseq(rpl)->method_id);
 				}
 			}
@@ -2087,6 +2087,50 @@ static inline void log_bogus_dst_leg(struct dlg_cell *dlg)
 			dlg_leg_print_info( dlg, callee_idx(dlg), tag),dlg->legs_no[DLG_LEGS_USED]);
 }
 
+/* move a request to the CSeq space OpenSIPS uses towards leg (uac_auth,
+ * pings); its reply gets the original CSeq back */
+static void dlg_seq_fix_cseq(struct dlg_cell *dlg, struct sip_msg *req,
+		int leg)
+{
+	struct dlg_entry *d_entry = &(d_table->entries[dlg->h_entry]);
+	unsigned int update_val;
+	str *msg_cseq;
+	char *final_cseq;
+
+	if ((!req->cseq && parse_headers(req, HDR_CSEQ_F, 0) < 0) ||
+	!req->cseq || !req->cseq->parsed) {
+		LM_ERR("bad request or missing CSeq hdr\n");
+		return;
+	}
+
+	dlg_lock(d_table, d_entry);
+	if (!dlg->legs[leg].last_gen_cseq) {
+		dlg_unlock(d_table, d_entry);
+		return;
+	}
+	update_val = ++(dlg->legs[leg].last_gen_cseq);
+	dlg_unlock(d_table, d_entry);
+	LM_DBG("incremented last_gen_cseq to [%d] on leg %d\n", update_val, leg);
+
+	if (update_msg_cseq(req, 0, update_val) != 0)
+		LM_ERR("failed to update msg cseq\n");
+
+	msg_cseq = &((struct cseq_body *)req->cseq->parsed)->number;
+	final_cseq = shm_malloc(msg_cseq->len + 1);
+	if (!final_cseq) {
+		LM_ERR("no more shm mem\n");
+		return;
+	}
+	memcpy(final_cseq, msg_cseq->s, msg_cseq->len);
+	final_cseq[msg_cseq->len] = 0;
+
+	if (d_tmb.register_tmcb(req, 0, TMCB_RESPONSE_FWDED, fix_final_cseq,
+	(void *)final_cseq, free_final_cseq) < 0) {
+		LM_ERR("failed to register TMCB\n");
+		shm_free(final_cseq);
+	}
+}
+
 void dlg_onroute(struct sip_msg* req, str *route_params, void *param)
 {
 	struct dlg_cell *dlg;
@@ -2105,7 +2149,6 @@ void dlg_onroute(struct sip_msg* req, str *route_params, void *param)
 	int ret = 0,ok = 1;
 	struct dlg_entry *d_entry;
 	str *msg_cseq;
-	char *final_cseq;
 	int is_active = 1;
 	struct cell *t;
 
@@ -2249,42 +2292,7 @@ void dlg_onroute(struct sip_msg* req, str *route_params, void *param)
 		/* a request after dialog termination */
 		/* within dialog request */
 		run_dlg_callbacks(DLGCB_REQ_WITHIN, dlg, req, dir, dst_leg, NULL, 0, 1);
-
-		/* update the cseq */
-		dlg_lock (d_table,d_entry);
-		if (dlg->legs[dst_leg].last_gen_cseq) {
-
-			LM_DBG("last_gen_cseq is [%d]\n",
-				dlg->legs[dst_leg].last_gen_cseq);
-			update_val = ++(dlg->legs[dst_leg].last_gen_cseq);
-			LM_DBG("incrementing last_gen_cseq to [%d]\n",
-				dlg->legs[dst_leg].last_gen_cseq);
-			dlg_unlock (d_table,d_entry);
-
-			LM_DBG("update_msg_cseq(BYE,NULL,%d)\n", update_val);
-			if (update_msg_cseq(req,0,update_val) != 0)
-				LM_ERR("failed to update BYE msg cseq\n");
-
-			msg_cseq = &((struct cseq_body *)req->cseq->parsed)->number;
-
-			final_cseq = shm_malloc(msg_cseq->len + 1);
-			if (final_cseq == 0) {
-				LM_ERR("no more shm mem\n");
-				goto after_unlock5;
-			}
-
-			memcpy(final_cseq,msg_cseq->s,msg_cseq->len);
-			final_cseq[msg_cseq->len] = 0;
-
-			if ( d_tmb.register_tmcb( req, 0, TMCB_RESPONSE_FWDED,
-			fix_final_cseq,
-			(void*)final_cseq, free_final_cseq)<0 ) {
-				LM_ERR("failed to register TMCB (2)\n");
-			}
-		}
-		else
-			dlg_unlock (d_table,d_entry);
-
+		dlg_seq_fix_cseq(dlg, req, dst_leg);
 		return;
 	}
 
@@ -2307,41 +2315,7 @@ void dlg_onroute(struct sip_msg* req, str *route_params, void *param)
 		}
 
 		LM_DBG("BYE successfully processed - dst_leg = %d\n",dst_leg);
-
-		dlg_lock (d_table,d_entry);
-		if (dlg->legs[dst_leg].last_gen_cseq) {
-
-			LM_DBG("last_gen_cseq is [%d]\n",
-				dlg->legs[dst_leg].last_gen_cseq);
-			update_val = ++(dlg->legs[dst_leg].last_gen_cseq);
-			LM_DBG("incrementing last_gen_cseq to [%d]\n",
-				dlg->legs[dst_leg].last_gen_cseq);
-			dlg_unlock (d_table,d_entry);
-
-			if (update_msg_cseq(req,0,update_val) != 0)
-				LM_ERR("failed to update BYE msg cseq\n");
-
-			msg_cseq = &((struct cseq_body *)req->cseq->parsed)->number;
-
-			final_cseq = shm_malloc(msg_cseq->len + 1);
-			if (final_cseq == 0) {
-				LM_ERR("no more shm mem\n");
-				goto after_unlock5;
-			}
-
-			memcpy(final_cseq,msg_cseq->s,msg_cseq->len);
-			final_cseq[msg_cseq->len] = 0;
-
-			if ( d_tmb.register_tmcb( req, 0, TMCB_RESPONSE_FWDED,
-			fix_final_cseq,
-			(void*)final_cseq, free_final_cseq)<0 ) {
-				LM_ERR("failed to register TMCB (2)\n");
-			}
-		}
-		else
-			dlg_unlock (d_table,d_entry);
-
-after_unlock5:
+		dlg_seq_fix_cseq(dlg, req, dst_leg);
 
 		/* remove from timer */
 		ret = remove_dlg_timer(&dlg->tl);
@@ -2379,6 +2353,24 @@ after_unlock5:
 		unref_dlg(dlg, unref);
 
 		if_update_stat( dlg_enable_stats, active_dlgs, -1);
+		return;
+	}
+
+	if (event==DLG_EVENT_REQBYE && dir==DLG_DIR_DOWNSTREAM &&
+	dst_leg!=dlg->legs_no[DLG_LEG_200OK] &&
+	(new_state==DLG_STATE_CONFIRMED || new_state==DLG_STATE_CONFIRMED_NA)) {
+		/* BYE to a forked 2xx leg (RFC 3261 13.2.2.4): route it, keep the dialog */
+		LM_DBG("BYE on secondary callee leg %d, dialog kept\n", dst_leg);
+		dlg_seq_fix_cseq(dlg, req, dst_leg);
+		run_dlg_callbacks(DLGCB_REQ_WITHIN, dlg, req, dir, dst_leg, NULL, 0, 1);
+		if (dlg->cbs.types & DLGCB_RESPONSE_WITHIN) {
+			ref_dlg(dlg, 1);
+			if (d_tmb.register_tmcb(req, 0, TMCB_RESPONSE_FWDED,
+			dlg_seq_up_onreply, (void *)dlg, unreference_dialog) < 0) {
+				LM_ERR("failed to register TMCB\n");
+				unref_dlg(dlg, 1);
+			}
+		}
 		return;
 	}
 

@@ -581,6 +581,10 @@ void indialog_ua(struct dlg_cell* dlg, int type, struct dlg_cb_params * params){
 	LM_DBG(" New sequential request method:%.*s \n",msg->first_line.u.request.method.len,msg->first_line.u.request.method.s);
 
 	if (memcmp(msg->first_line.u.request.method.s,"BYE", msg->first_line.u.request.method.len) == 0) {
+		/* a BYE to a forked 2xx leg leaves the dialog confirmed: the call goes on */
+		if (type == DLGCB_REQ_WITHIN && (dlg->state == DLG_STATE_CONFIRMED ||
+		dlg->state == DLG_STATE_CONFIRMED_NA))
+			return;
 		LM_DBG(" --- TREAT BYE  -----  \n \n");
 
 		resp = bye(msg,dir);
